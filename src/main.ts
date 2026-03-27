@@ -12,7 +12,7 @@ async function main() {
   });
 
   const prompt = () =>
-    new Promise<string>((resolve) => rl.question("\x1b[36ms01 >> \x1b[0m", resolve));
+    new Promise<string>((resolve) => rl.question("\x1b[36mlite-agent >> \x1b[0m", resolve));
 
   while (true) {
     const query = await prompt();
