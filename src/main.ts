@@ -1,7 +1,29 @@
 import dotenv from "dotenv";
 import { liteAgent } from "./agent";
 import { MessageParam } from "@anthropic-ai/sdk/resources";
+import { resolve } from "node:path";
 dotenv.config();
+
+
+// 确定工作空间，不让 agent 逃逸出工作空间
+const WORKDIR = process.cwd();
+
+// 系统提示词
+const SYSTEM = `You are a coding agent at ${WORKDIR}.
+// TodoManager: Track tasks with status and nag reminders
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose.
+For any task with 3+ steps, ALWAYS call todo first to plan, then execute step by step.
+`;
+
+
+// 操作文件一定只能操作工作空间内的文件
+export function safePath(p: string) {
+  const path = resolve(WORKDIR, p);
+  if (!path.startsWith(WORKDIR))
+    throw new Error(`Path escapes workspace: ${p}`);
+  return path;
+}
 
 async function main() {
   const history: MessageParam[] = [];
@@ -18,16 +40,24 @@ async function main() {
     const query = await prompt();
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
-    history.push({ role: "user", content: query });
-    await liteAgent(history);
+    const forceTool = query.startsWith("/todo") ? "todo" : undefined;
+    history.push({ role: "user", content: query.replace("/todo", "").trim() || "Update todos." });
+    await liteAgent({
+      messages: history,
+      system: SYSTEM,
+      forceTool
+    });
 
+    // 取出最后一个消息的 content
     const lastContent = history[history.length - 1].content;
+
+    //  打印最后一个消息的 content
     if (Array.isArray(lastContent)) {
       for (const block of lastContent) {
         if (block.type === "text") console.log(block.text);
       }
-    }
-    console.log();
+    } else
+      console.log(lastContent);
   }
   rl.close();
 }

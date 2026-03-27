@@ -13,6 +13,11 @@ export const BASH_TOOL_SCHEMA = {
   },
 }
 
+// log bash 命令
+function LogBashCommand(command: string) {
+  console.log(`\x1b[32m$ ${command}\x1b[0m`);
+}
+
 // 运行 bash 命令
 export function runBash(command: string) {
   // 危险命令, 后续需要通过统一管道过滤
@@ -22,6 +27,7 @@ export function runBash(command: string) {
   }
 
   try {
+    LogBashCommand(command);
     // 执行命令
     const output = execSync(command, {
       cwd: process.cwd(),
