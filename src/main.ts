@@ -2,19 +2,13 @@ import dotenv from "dotenv";
 import { liteAgent } from "./agent";
 import { MessageParam } from "@anthropic-ai/sdk/resources";
 import { resolve } from "node:path";
+import { buildMainAgentPrompt } from "./prompt/system";
 dotenv.config();
-
 
 // 确定工作空间，不让 agent 逃逸出工作空间
 const WORKDIR = process.cwd();
 
-// 系统提示词
-const SYSTEM = `You are a coding agent at ${WORKDIR}.
-// TodoManager: Track tasks with status and nag reminders
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Prefer tools over prose.
-For any task with 3+ steps, ALWAYS call todo first to plan, then execute step by step.
-`;
+const SYSTEM = buildMainAgentPrompt(WORKDIR);
 
 
 // 操作文件一定只能操作工作空间内的文件
