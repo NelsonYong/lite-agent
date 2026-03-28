@@ -1,12 +1,16 @@
 import dotenv from "dotenv";
 import { liteAgent } from "./agent";
 import { MessageParam } from "@anthropic-ai/sdk/resources";
-import { resolve } from "node:path";
+import { resolve, join } from "node:path";
+import { initSkillLoader } from "./agent/skill";
 import { buildMainAgentPrompt } from "./prompt/system";
 dotenv.config();
 
 // 确定工作空间，不让 agent 逃逸出工作空间
 const WORKDIR = process.cwd();
+
+// 全局初始化一次，system.ts 和 tools/index.ts 共用同一实例
+initSkillLoader(join(WORKDIR, "skills"));
 
 const SYSTEM = buildMainAgentPrompt(WORKDIR);
 

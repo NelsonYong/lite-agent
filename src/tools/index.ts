@@ -1,3 +1,4 @@
+import { getSkillLoader } from "../agent/skill";
 import { BASH_TOOL_SCHEMA, runBash } from "./bash";
 import { editFile, FILE_TOOL_SCHEMA, readFile, writeFile } from "./file";
 import { TODO, TODO_TOOL_SCHEMA, TodoInput } from "./todo";
@@ -23,6 +24,7 @@ export const toolHandlers: Record<string, (input: any) => string | Promise<strin
   edit_file: ({ path, old_text, new_text }: { path: string; old_text: string; new_text: string }) =>
     editFile(path, old_text, new_text),
   todo: ({ items }: { items: TodoInput[] }) => TODO.update(items),
+  load_skill: ({ name }: { name: string }) => getSkillLoader().getContent(name)
 };
 
 export const baseTools = [BASH_TOOL_SCHEMA, ...FILE_TOOL_SCHEMA, TODO_TOOL_SCHEMA];
