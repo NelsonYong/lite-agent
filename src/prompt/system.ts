@@ -6,7 +6,8 @@ export function buildMainAgentPrompt(workdir: string) {
     throw new Error("workdir is required");
   }
 
-  return `You are a coding agent at ${workdir}.
+  return `You are a coding agent at ${workdir}.Use tools to solve tasks.
+
 // TodoManager: Track tasks with status and nag reminders
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose.
@@ -14,10 +15,8 @@ For any task with 3+ steps, ALWAYS call todo first to plan, then execute step by
 
 
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
-
 Skills available:
 ${getSkillLoader().getDescriptions()}
-
 `
 }
 
