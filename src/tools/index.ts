@@ -1,10 +1,12 @@
 import { getSkillLoader } from "../agent/skill";
+import { runSubagent } from "../agent/subagent";
 import { BASH_TOOL_SCHEMA, runBash } from "./bash";
 import { editFile, FILE_TOOL_SCHEMA, readFile, writeFile } from "./file";
+import { TASK_OPERATIONS_SCHEMA, TASKS, TaskStatus } from "./task";
 import { TODO, TODO_TOOL_SCHEMA, TodoInput } from "./todo";
 
-export const TASK_TOOL_SCHEMA = {
-  name: "task",
+export const AGENT_TOOL_SCHEMA = {
+  name: "agent",
   description:
     "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
   input_schema: {
@@ -54,6 +56,29 @@ export const toolHandlers: Record<
   }) => editFile(path, old_text, new_text),
   todo: ({ items }: { items: TodoInput[] }) => TODO.update(items),
   load_skill: ({ name }: { name: string }) => getSkillLoader().getContent(name),
+  agent: ({ prompt }: { prompt: string }) => runSubagent(prompt),
+  // 创建新任务
+  task_create: ({
+    subject,
+    description,
+  }: {
+    subject: string;
+    description: string;
+  }) => TASKS.create(subject, description),
+  task_update: ({
+    task_id,
+    status,
+    addBlockedBy,
+    addBlocks,
+  }: {
+    task_id: number;
+    status: TaskStatus;
+    addBlockedBy: number[];
+    addBlocks: number[];
+  }) => TASKS.update(task_id, status, addBlockedBy, addBlocks),
+  // 列出所有任务
+  task_list: () => TASKS.listAll(),
+  task_get: ({ task_id }: { task_id: number }) => TASKS.get(task_id),
 };
 
 export const baseTools = [
@@ -62,6 +87,11 @@ export const baseTools = [
   TODO_TOOL_SCHEMA,
 ];
 
-export const mainAgentTools = [...baseTools, TASK_TOOL_SCHEMA, COMPACT_TOOL_SCHEMA];
+export const mainAgentTools = [
+  ...baseTools,
+  AGENT_TOOL_SCHEMA,
+  ...TASK_OPERATIONS_SCHEMA,
+  COMPACT_TOOL_SCHEMA,
+];
 
 export const subagentTools = [...baseTools];

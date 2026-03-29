@@ -1,8 +1,54 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
-type TaskStatus = 'pending' | 'in_progress' | 'completed';
+export type TaskStatus = "pending" | "in_progress" | "completed";
 
+export const TASK_OPERATIONS_SCHEMA = [
+  {
+    name: "task_create",
+    description: "Create a new task.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        subject: { type: "string" },
+        description: { type: "string" },
+        owner: { type: "string", description: "Owner identifier (e.g., subagent ID)" },
+      },
+      required: ["subject"],
+    },
+  },
+  {
+    name: "task_update",
+    description: "Update a task's status or dependencies.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        task_id: { type: "integer" },
+        status: {
+          type: "string",
+          enum: ["pending", "in_progress", "completed"],
+        },
+        addBlockedBy: { type: "array", items: { type: "integer" } },
+        addBlocks: { type: "array", items: { type: "integer" } },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "task_list",
+    description: "List all tasks with status summary.",
+    input_schema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "task_get",
+    description: "Get full details of a task by ID.",
+    input_schema: {
+      type: "object" as const,
+      properties: { task_id: { type: "integer" } },
+      required: ["task_id"],
+    },
+  },
+];
 interface Task {
   id: number;
   subject: string;
@@ -10,16 +56,15 @@ interface Task {
   status: TaskStatus;
   blockedBy: number[];
   blocks: number[];
-  owner: string;
 }
 
 const STATUS_MARKER: Record<TaskStatus, string> = {
-  pending: '[ ]',
-  in_progress: '[>]',
-  completed: '[x]',
+  pending: "[ ]",
+  in_progress: "[>]",
+  completed: "[x]",
 };
 
-const TASKS_DIR = join(process.cwd(), '.tasks');
+const TASKS_DIR = join(process.cwd(), ".tasks");
 
 class TaskManager {
   private dir: string;
@@ -34,8 +79,8 @@ class TaskManager {
   private maxId(): number {
     try {
       const ids = readdirSync(this.dir)
-        .filter((f) => f.startsWith('task_') && f.endsWith('.json'))
-        .map((f) => parseInt(f.split('_')[1]))
+        .filter((f) => f.startsWith("task_") && f.endsWith(".json"))
+        .map((f) => parseInt(f.split("_")[1]))
         .filter((n) => !isNaN(n));
       return ids.length ? Math.max(...ids) : 0;
     } catch {
@@ -46,7 +91,7 @@ class TaskManager {
   private load(taskId: number): Task {
     const path = join(this.dir, `task_${taskId}.json`);
     try {
-      return JSON.parse(readFileSync(path, 'utf8')) as Task;
+      return JSON.parse(readFileSync(path, "utf8")) as Task;
     } catch {
       throw new Error(`Task ${taskId} not found`);
     }
@@ -58,28 +103,27 @@ class TaskManager {
   }
 
   private clearDependency(completedId: number): void {
-    try {
-      for (const file of readdirSync(this.dir)) {
-        if (!file.startsWith('task_') || !file.endsWith('.json')) continue;
-        const task = JSON.parse(readFileSync(join(this.dir, file), 'utf8')) as Task;
-        if (task.blockedBy?.includes(completedId)) {
-          task.blockedBy = task.blockedBy.filter((id) => id !== completedId);
-          this.save(task);
-        }
+    for (const file of readdirSync(this.dir)) {
+      if (!file.startsWith("task_") || !file.endsWith(".json")) continue;
+      const task = JSON.parse(
+        readFileSync(join(this.dir, file), "utf8"),
+      ) as Task;
+      if (task.blockedBy?.includes(completedId)) {
+        task.blockedBy = task.blockedBy.filter((id) => id !== completedId);
+        this.save(task);
       }
-    } catch { }
+    }
   }
 
   /** 创建新任务 */
-  create(subject: string, description = ''): string {
+  create(subject: string, description = ""): string {
     const task: Task = {
       id: this.nextId,
       subject,
       description,
-      status: 'pending',
+      status: "pending",
       blockedBy: [],
       blocks: [],
-      owner: '',
     };
     this.save(task);
     this.nextId++;
@@ -101,27 +145,31 @@ class TaskManager {
     const task = this.load(taskId);
 
     if (status) {
-      if (!(['pending', 'in_progress', 'completed'] as TaskStatus[]).includes(status)) {
-        throw new Error(`Invalid status: ${status}`);
-      }
       task.status = status;
-      if (status === 'completed') this.clearDependency(taskId);
+      if (status === "completed") this.clearDependency(taskId);
     }
 
     if (addBlockedBy) {
       task.blockedBy = [...new Set([...task.blockedBy, ...addBlockedBy])];
+      // 反向同步：在对方的 blocks 里记录当前 task
+      for (const blockerId of addBlockedBy) {
+        const blocker = this.load(blockerId);
+        if (!blocker.blocks.includes(taskId)) {
+          blocker.blocks.push(taskId);
+          this.save(blocker);
+        }
+      }
     }
 
     if (addBlocks) {
       task.blocks = [...new Set([...task.blocks, ...addBlocks])];
+      // 反向同步：在对方的 blockedBy 里记录当前 task
       for (const blockedId of addBlocks) {
-        try {
-          const blocked = this.load(blockedId);
-          if (!blocked.blockedBy.includes(taskId)) {
-            blocked.blockedBy.push(taskId);
-            this.save(blocked);
-          }
-        } catch { }
+        const blocked = this.load(blockedId);
+        if (!blocked.blockedBy.includes(taskId)) {
+          blocked.blockedBy.push(taskId);
+          this.save(blocked);
+        }
       }
     }
 
@@ -133,19 +181,23 @@ class TaskManager {
   listAll(): string {
     try {
       const tasks = readdirSync(this.dir)
-        .filter((f) => f.startsWith('task_') && f.endsWith('.json'))
-        .map((f) => JSON.parse(readFileSync(join(this.dir, f), 'utf8')) as Task)
+        .filter((f) => f.startsWith("task_") && f.endsWith(".json"))
+        .map((f) => JSON.parse(readFileSync(join(this.dir, f), "utf8")) as Task)
         .sort((a, b) => a.id - b.id);
 
-      if (!tasks.length) return 'No tasks.';
+      if (!tasks.length) return "No tasks.";
 
-      return tasks.map((t) => {
-        const marker = STATUS_MARKER[t.status] ?? '[?]';
-        const blocked = t.blockedBy?.length ? ` (blocked by: ${t.blockedBy})` : '';
-        return `${marker} #${t.id}: ${t.subject}${blocked}`;
-      }).join('\n');
+      return tasks
+        .map((t) => {
+          const marker = STATUS_MARKER[t.status] ?? "[?]";
+          const blocked = t.blockedBy?.length
+            ? ` (blocked by: ${t.blockedBy})`
+            : "";
+          return `${marker} #${t.id}: ${t.subject}${blocked}`;
+        })
+        .join("\n");
     } catch {
-      return 'No tasks.';
+      return "No tasks.";
     }
   }
 }

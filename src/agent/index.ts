@@ -1,6 +1,5 @@
 import { MessageParam, Model, TextBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import { getClient } from "./client";
-import { runSubagent } from "./subagent";
 import { mainAgentTools, toolHandlers } from "../tools";
 import { autoCompact, microCompact } from "./compact";
 
@@ -58,11 +57,6 @@ export async function liteAgent({
         if (block.name === 'compact') {
           manualCompact = true;
           output = 'Compressing...';
-        }
-        else if (block.name === "task") {
-          const desc = input.description || "subtask";
-          console.log(`> task (${desc}): ${input.prompt.slice(0, 80)}`);
-          output = await runSubagent(input.prompt);
         } else {
           const handler = toolHandlers[block.name];
           output = handler
