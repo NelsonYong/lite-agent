@@ -1,0 +1,8 @@
+limit-detail.general-limit-sub-permanent-date-v3	No restriction	制限なし	Tidak ada batasan	
+limit-detail.general-limit-sub-temporary-date-v3	For all products, expires on {date}	全商品対象、{date} に失効	Untuk semua produk, berlaku hingga {date}	
+limit-detail.campaign-limit-sub-temporary-title-v3	Additional Limit Boost	追加限度額ブースト	Tambahan Boost Limit	
+limit-detail.campaign-limit-sub-temporary-date-v3	With selected stores by {date}		Dengan toko pilihan hingga {date}	
+limit-detail.installment-limit-text-v3	For Instalment only, can be combined with Temporary and Permanent Limit, expires on {date}	分割払い専用。一時枠・永久枠と併用可能。{date} に失効	Khusus Cicilan, dapat digabungkan dengan Limit Sementara dan Permanen, berlaku hingga {date}	
+limit-detail.installment-limit-text-v3-no-date	For Instalment only, can be combined with Temporary and Permanent Limit			
+limit-detail.limit-history-entry	Limit History		Riwayat Limit	
+limit-detail.limit-history-page-titl

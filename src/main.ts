@@ -32,7 +32,45 @@ async function main() {
   });
 
   const prompt = () =>
-    new Promise<string>((resolve) => rl.question("\x1b[36mlite-agent >> \x1b[0m", resolve));
+    new Promise<string>((resolvePromise) => {
+      const lines: string[] = [];
+      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+      let multilineMode = false;
+
+      const submit = () => {
+        rl.removeListener("line", onLine);
+        resolvePromise(lines.join("\n"));
+      };
+
+      const onLine = (line: string) => {
+        // 多行模式：空行提交，否则继续追加
+        if (multilineMode) {
+          if (line === "") {
+            submit();
+          } else {
+            lines.push(line);
+            process.stdout.write("\x1b[90m...  \x1b[0m");
+          }
+          return;
+        }
+
+        if (debounceTimer) clearTimeout(debounceTimer);
+        lines.push(line);
+
+        debounceTimer = setTimeout(() => {
+          if (lines.length > 1) {
+            // 检测到多行粘贴，进入多行模式，等待空行提交
+            multilineMode = true;
+            process.stdout.write("\x1b[90m[多行模式：继续粘贴或输入空行提交]\x1b[0m\n\x1b[90m...  \x1b[0m");
+          } else {
+            submit();
+          }
+        }, 50);
+      };
+
+      process.stdout.write("\x1b[36mlite-agent >> \x1b[0m");
+      rl.on("line", onLine);
+    });
 
   while (true) {
     const query = await prompt();
