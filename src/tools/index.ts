@@ -1,3 +1,4 @@
+import { BG, BG_TOOL_SCHEMA } from "../agent/background";
 import { getSkillLoader } from "../agent/skill";
 import { runSubagent } from "../agent/subagent";
 import { BASH_TOOL_SCHEMA, runBash } from "./bash";
@@ -79,6 +80,10 @@ export const toolHandlers: Record<
   // 列出所有任务
   task_list: () => TASKS.listAll(),
   task_get: ({ task_id }: { task_id: number }) => TASKS.get(task_id),
+
+  // 后台运行命令
+  background_run: ({ command }: { command: string }) => BG.run(command),
+  check_background: ({ task_id }: { task_id: string }) => BG.check(task_id),
 };
 
 export const baseTools = [
@@ -90,6 +95,7 @@ export const baseTools = [
 export const mainAgentTools = [
   ...baseTools,
   AGENT_TOOL_SCHEMA,
+  ...BG_TOOL_SCHEMA,
   ...TASK_OPERATIONS_SCHEMA,
   COMPACT_TOOL_SCHEMA,
 ];

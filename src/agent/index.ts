@@ -1,8 +1,13 @@
-import { MessageParam, Model, TextBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
+import {
+  MessageParam,
+  Model,
+  TextBlockParam,
+  ToolResultBlockParam,
+} from "@anthropic-ai/sdk/resources";
 import { getClient } from "./client";
 import { mainAgentTools, toolHandlers } from "../tools";
 import { autoCompact, microCompact } from "./compact";
-
+import { BG } from "./background";
 
 const COMPACT_MAX_TOKENS_THRESHOLD = 150_000;
 
@@ -25,8 +30,24 @@ export async function liteAgent({
 
     // 超过 150k 时触发深度压缩：调用 LLM 生成摘要，替换全部历史消息
     if (lastInputTokens > COMPACT_MAX_TOKENS_THRESHOLD) {
-      console.log('[auto_compact triggered]');
+      console.log("[auto_compact triggered]");
       messages = await autoCompact(messages);
+    }
+
+    // 获取并清空通知队列
+    const notifs = BG.drainNotifications();
+    if (notifs.length && messages.length) {
+      const notifText = notifs
+        .map((n) => `[bg:${n.task_id}] ${n.status}: ${n.result}`)
+        .join("\n");
+      messages.push({
+        role: "user",
+        content: `<background-results>\n${notifText}\n</background-results>`,
+      });
+      messages.push({
+        role: "assistant",
+        content: "Noted background results.",
+      });
     }
 
     // 调用 llm
@@ -54,9 +75,9 @@ export async function liteAgent({
       let output: string;
 
       try {
-        if (block.name === 'compact') {
+        if (block.name === "compact") {
           manualCompact = true;
-          output = 'Compressing...';
+          output = "Compressing...";
         } else {
           const handler = toolHandlers[block.name];
           output = handler
@@ -69,7 +90,11 @@ export async function liteAgent({
         console.log(`> ${block.name}: ${output}`);
       }
 
-      results.push({ type: "tool_result", tool_use_id: block.id, content: output! });
+      results.push({
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: output!,
+      });
     }
 
     roundsSinceTodo = usedTodo ? 0 : roundsSinceTodo + 1;
@@ -81,8 +106,8 @@ export async function liteAgent({
     }
 
     if (manualCompact) {
-      console.log('[manual compact]');
-      messages.splice(0, messages.length, ...await autoCompact(messages));
+      console.log("[manual compact]");
+      messages.splice(0, messages.length, ...(await autoCompact(messages)));
     }
 
     messages.push({ role: "user", content: results });
