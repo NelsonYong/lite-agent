@@ -8,6 +8,7 @@ import { getClient } from "./client";
 import { mainAgentTools, toolHandlers } from "../tools";
 import { autoCompact, microCompact } from "./compact";
 import { BG } from "./background";
+import { BUS } from "./agentTeam";
 
 const COMPACT_MAX_TOKENS_THRESHOLD = 150_000;
 
@@ -48,6 +49,15 @@ export async function liteAgent({
         role: "assistant",
         content: "Noted background results.",
       });
+    }
+
+    const inbox = BUS.readInbox("lead");
+    if (inbox.length) {
+      messages.push({
+        role: "user",
+        content: `<inbox>${JSON.stringify(inbox, null, 2)}</inbox>`,
+      });
+      messages.push({ role: "assistant", content: "Noted inbox messages." });
     }
 
     // 调用 llm

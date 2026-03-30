@@ -12,7 +12,10 @@ export const TASK_OPERATIONS_SCHEMA = [
       properties: {
         subject: { type: "string" },
         description: { type: "string" },
-        owner: { type: "string", description: "Owner identifier (e.g., subagent ID)" },
+        owner: {
+          type: "string",
+          description: "Owner identifier (e.g., subagent ID)",
+        },
       },
       required: ["subject"],
     },

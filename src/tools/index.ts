@@ -1,3 +1,4 @@
+import { AGENT_TEAM_SCHEMA, BUS, TEAM } from "../agent/agentTeam";
 import { BG, BG_TOOL_SCHEMA } from "../agent/background";
 import { getSkillLoader } from "../agent/skill";
 import { runSubagent } from "../agent/subagent";
@@ -84,6 +85,15 @@ export const toolHandlers: Record<
   // 后台运行命令
   background_run: ({ command }: { command: string }) => BG.run(command),
   check_background: ({ task_id }: { task_id: string }) => BG.check(task_id),
+
+  // agent team
+  spawn_teammate: ({ name, role, prompt }) => TEAM.spawn(name, role, prompt),
+  list_teammates: () => TEAM.listAll(),
+  send_message: ({ to, content, msg_type }) =>
+    BUS.send("lead", to, content, msg_type),
+  read_inbox: () => JSON.stringify(BUS.readInbox("lead"), null, 2),
+  broadcast: ({ content }) =>
+    BUS.broadcast("lead", content, TEAM.memberNames()),
 };
 
 export const baseTools = [
@@ -94,6 +104,7 @@ export const baseTools = [
 
 export const mainAgentTools = [
   ...baseTools,
+  ...AGENT_TEAM_SCHEMA,
   AGENT_TOOL_SCHEMA,
   ...BG_TOOL_SCHEMA,
   ...TASK_OPERATIONS_SCHEMA,

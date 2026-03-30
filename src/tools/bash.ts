@@ -1,6 +1,5 @@
 import { execSync } from "child_process";
 
-
 export const BASH_TOOL_SCHEMA = {
   name: "bash",
   description: "Run a shell command.",
@@ -11,17 +10,24 @@ export const BASH_TOOL_SCHEMA = {
     },
     required: ["command"],
   },
-}
+};
 
 // log bash 命令
 function LogBashCommand(command: string) {
-  console.log(`\x1b[32m$ ${command}\x1b[0m`);
+  // 打印格式 Bash(command)
+  console.log(`\x1b[32mBash(${command})\x1b[0m`);
 }
 
 // 运行 bash 命令
 export function runBash(command: string) {
   // 危险命令, 后续需要通过统一管道过滤
-  const dangerousCommands = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"];
+  const dangerousCommands = [
+    "rm -rf /",
+    "sudo",
+    "shutdown",
+    "reboot",
+    "> /dev/",
+  ];
   if (dangerousCommands.some((d) => command.includes(d))) {
     return "Error: Dangerous command blocked";
   }
@@ -42,5 +48,4 @@ export function runBash(command: string) {
       (e.stdout + e.stderr).trim().slice(0, 50000) || `Error: ${e.message}`
     );
   }
-
 }

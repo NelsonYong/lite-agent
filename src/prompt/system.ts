@@ -8,6 +8,9 @@ export function buildMainAgentPrompt(workdir: string) {
 
   return `You are a coding agent at ${workdir}.Use tools to solve tasks.
 
+  Your model is ${process.env["MODEL_ID"]}.
+  Your name is lite-agent.
+
 // TodoManager: Track tasks with status and nag reminders
 Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
 Prefer tools over prose.
@@ -17,7 +20,7 @@ For any task with 3+ steps, ALWAYS call todo first to plan, then execute step by
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Skills available:
 ${getSkillLoader().getDescriptions()}
-`
+`;
 }
 
 // 构建 subagent 提示词

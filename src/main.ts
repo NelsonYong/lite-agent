@@ -4,6 +4,7 @@ import { MessageParam } from "@anthropic-ai/sdk/resources";
 import { resolve, join } from "node:path";
 import { initSkillLoader } from "./agent/skill";
 import { buildMainAgentPrompt } from "./prompt/system";
+import { BUS, TEAM } from "./agent/agentTeam";
 dotenv.config();
 
 // 确定工作空间，不让 agent 逃逸出工作空间
@@ -13,7 +14,6 @@ const WORKDIR = process.cwd();
 initSkillLoader(join(WORKDIR, "skills"));
 
 const SYSTEM = buildMainAgentPrompt(WORKDIR);
-
 
 // 操作文件一定只能操作工作空间内的文件
 export function safePath(p: string) {
@@ -61,7 +61,9 @@ async function main() {
           if (lines.length > 1) {
             // 检测到多行粘贴，进入多行模式，等待空行提交
             multilineMode = true;
-            process.stdout.write("\x1b[90m[多行模式：继续粘贴或输入空行提交]\x1b[0m\n\x1b[90m...  \x1b[0m");
+            process.stdout.write(
+              "\x1b[90m[多行模式：继续粘贴或输入空行提交]\x1b[0m\n\x1b[90m...  \x1b[0m",
+            );
           } else {
             submit();
           }
@@ -76,12 +78,24 @@ async function main() {
     const query = await prompt();
     if (!query || ["q", "exit"].includes(query.trim().toLowerCase())) break;
 
+    if (query.trim() === "/team") {
+      console.log(TEAM.listAll());
+      continue;
+    }
+    if (query.trim() === "/inbox") {
+      console.log(JSON.stringify(BUS.readInbox("lead"), null, 2));
+      continue;
+    }
+
     const forceTool = query.startsWith("/todo") ? "todo" : undefined;
-    history.push({ role: "user", content: query.replace("/todo", "").trim() || "Update todos." });
+    history.push({
+      role: "user",
+      content: query.replace("/todo", "").trim() || "Update todos.",
+    });
     await liteAgent({
       messages: history,
       system: SYSTEM,
-      forceTool
+      forceTool,
     });
 
     // 取出最后一个消息的 content
@@ -92,8 +106,7 @@ async function main() {
       for (const block of lastContent) {
         if (block.type === "text") console.log(block.text);
       }
-    } else
-      console.log(lastContent);
+    } else console.log(lastContent);
   }
   rl.close();
 }
