@@ -107,6 +107,7 @@ export const toolHandlers: Record<
   shutdown_request: ({ teammate }) => handleShutdownRequest(teammate),
   shutdown_response: ({ request_id }) =>
     JSON.stringify(shutdownRequests[request_id] || { error: "not found" }),
+  force_shutdown: ({ teammate }) => TEAM.forceShutdown(teammate),
   plan_approval: ({ request_id, approve, feedback }) =>
     handlePlanReview(request_id, approve, feedback),
 };

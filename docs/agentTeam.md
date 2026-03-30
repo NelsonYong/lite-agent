@@ -312,6 +312,7 @@ Lead Agent 通过以下工具管理团队：
 |--------|------|------|------|
 | `shutdown_request` | 请求 teammate 关闭 | `teammate` | 向指定 teammate 发送关闭请求，返回 `request_id` 用于追踪 |
 | `shutdown_response` | 查询关闭请求状态 | `request_id` | 通过 `request_id` 查询 teammate 是否已响应（approved/rejected） |
+| `force_shutdown` | 强制关闭 teammate | `teammate` | 绕过优雅关闭协议，在 teammate 下一轮循环迭代时立即终止。用于 teammate 拒绝 `shutdown_request` 后的兜底手段 |
 | `plan_approval` | 审批 teammate 的计划 | `request_id`, `approve`, `feedback?` | 批准或拒绝 teammate 提交的工作计划，可附带反馈意见 |
 
 ---
@@ -358,11 +359,18 @@ lead 拒绝         → planRequests[request_id].status = "rejected"
 
 ---
 
-### Shutdown 协议（优雅关闭）
+### Shutdown 协议（两级关闭）
 
 解决的问题：原来 teammate 只能自然结束（50 轮耗尽或模型不再调用工具），无法被 lead 主动、安全地停止。
 
-#### 完整流程
+Lead 拥有两级关闭能力：
+
+| 级别 | 工具 | 性质 | teammate 可拒绝 |
+|------|------|------|-----------------|
+| L1 | `shutdown_request` | 优雅请求 | 是 |
+| L2 | `force_shutdown` | 强制终止 | 否 |
+
+#### L1：优雅关闭流程
 
 ```
 ┌──────────┐                    ┌──────────────┐                    ┌──────────┐
@@ -390,7 +398,38 @@ lead 拒绝         → planRequests[request_id].status = "rejected"
      │  （如果 approve = false）        │   继续工作                      │
      │                                 │   → 状态保持 "working"          │
      │                                 │                                 │
+     │  ┌─ L2 升级（可选）─────────┐   │                                 │
+     │  │ force_shutdown(teammate) │   │                                 │
+     │  │ → 见下方 L2 流程         │   │                                 │
+     │  └──────────────────────────┘   │                                 │
 ```
+
+#### L2：强制关闭流程
+
+当 teammate 拒绝 `shutdown_request` 后，lead 可升级为 `force_shutdown`：
+
+```
+┌──────────┐                                          ┌──────────┐
+│  Lead    │                                          │ Teammate │
+└────┬─────┘                                          └────┬─────┘
+     │                                                     │
+     │  force_shutdown("bob")                              │
+     │  → _forceShutdowns.add("bob")                       │
+     │  → 返回确认消息                                      │
+     │                                                     │
+     │                                     _teammateLoop 下一轮迭代:
+     │                                       检查 _forceShutdowns
+     │                                       → 命中，立即 break
+     │                                       → 状态设为 "shutdown"
+     │                                                     │
+```
+
+**实现机制：**
+
+- `TeammateManager` 维护一个内存集合 `_forceShutdowns: Set<string>`
+- `forceShutdown(name)` 方法校验 teammate 状态为 `working` 后，将其加入集合
+- `_teammateLoop` 每轮迭代**最先**检查 `_forceShutdowns`（优先于收件箱读取），命中则立即退出
+- 不经过消息总线，不依赖模型行为，lead 单方面生效
 
 #### 状态流转
 
@@ -400,9 +439,11 @@ teammate 同意   → shutdownRequests[request_id].status = "approved"
                   shouldExit = true → 优雅退出 → member.status = "shutdown"
 teammate 拒绝   → shutdownRequests[request_id].status = "rejected"
                   继续工作 → member.status 保持 "working"
+lead 强制关闭   → _forceShutdowns.add(name)
+                  → 下一轮迭代立即退出 → member.status = "shutdown"
 ```
 
-#### 优雅退出细节
+#### 优雅退出细节（L1 approve 场景）
 
 teammate approve shutdown 后的退出顺序：
 
@@ -412,6 +453,12 @@ teammate approve shutdown 后的退出顺序：
 4. 下一轮循环开始时，先读取收件箱（处理可能的剩余消息）
 5. 检测到 `shouldExit === true`，跳出循环
 6. 状态设为 `"shutdown"`，写入配置
+
+#### 强制退出细节（L2 场景）
+
+1. `_forceShutdowns` 检查在收件箱读取**之前**，确保不会再执行任何工具
+2. 当前正在执行的 API 调用/工具会完成（无法中断进行中的操作），但不会发起新的调用
+3. 状态直接设为 `"shutdown"`，写入配置
 
 ---
 
@@ -473,7 +520,7 @@ Lead 调用:
     确认 frontend 已关闭
 ```
 
-### 示例 3：拒绝关闭
+### 示例 3：拒绝关闭 → 强制关闭
 
 ```
 Lead 调用:
@@ -489,7 +536,19 @@ Lead 调用:
 
 → Lead:
     read_inbox() → 收到 shutdown_response（approve: false, reason: "数据库迁移进行中..."）
-    决定等待 backend 完成后再次请求关闭
+
+    方案 A — 等待: 决定等 backend 完成后再次请求关闭
+    方案 B — 强制: 调用 force_shutdown(teammate="backend")
+
+→ Lead 选择方案 B:
+    force_shutdown("backend")
+    → _forceShutdowns.add("backend")
+    → 返回 "Force shutdown issued for 'backend'. Will terminate at next loop iteration."
+
+→ _teammateLoop（backend）下一轮:
+    检查 _forceShutdowns → 命中 "backend"
+    立即跳出循环，不再读取收件箱或调用 API
+    状态设为 "shutdown"
 ```
 
 ---

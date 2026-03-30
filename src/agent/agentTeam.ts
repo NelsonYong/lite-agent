@@ -117,6 +117,16 @@ export const AGENT_TEAM_SCHEMA = [
     },
   },
   {
+    name: "force_shutdown",
+    description:
+      "Force a teammate to stop immediately, bypassing the graceful shutdown protocol. Use only after a teammate rejects a shutdown_request.",
+    input_schema: {
+      type: "object" as const,
+      properties: { teammate: { type: "string" } },
+      required: ["teammate"],
+    },
+  },
+  {
     name: "plan_approval",
     description:
       "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
@@ -219,6 +229,7 @@ class TeammateManager {
   private dir: string;
   private configPath: string;
   private config: TeamConfig;
+  private _forceShutdowns = new Set<string>();
 
   constructor(teamDir: string) {
     this.dir = teamDir;
@@ -277,6 +288,12 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
     let shouldExit = false;
 
     for (let i = 0; i < 50; i++) {
+      if (this._forceShutdowns.has(name)) {
+        this._forceShutdowns.delete(name);
+        debug(`[${name}] Force shutdown triggered, exiting loop`);
+        shouldExit = true;
+        break;
+      }
       const inbox = BUS.readInbox(name);
       for (const msg of inbox)
         messages.push({ role: "user", content: JSON.stringify(msg) });
@@ -473,6 +490,15 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
         },
       },
     ];
+  }
+
+  forceShutdown(name: string): string {
+    const member = this._findMember(name);
+    if (!member) return `Error: Unknown teammate '${name}'`;
+    if (member.status !== "working") return `Error: '${name}' is not working (status: ${member.status})`;
+    this._forceShutdowns.add(name);
+    debug(`Force shutdown issued for '${name}'`);
+    return `Force shutdown issued for '${name}'. Will terminate at next loop iteration.`;
   }
 
   listAll(): string {
