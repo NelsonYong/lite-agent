@@ -59,6 +59,7 @@ export const toolHandlers: Record<
   todo: ({ items }: { items: TodoInput[] }) => TODO.update(items),
   load_skill: ({ name }: { name: string }) => getSkillLoader().getContent(name),
   agent: ({ prompt }: { prompt: string }) => runSubagent(prompt),
+
   // 创建新任务
   task_create: ({
     subject,
