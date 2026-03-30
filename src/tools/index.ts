@@ -1,4 +1,3 @@
-import { randomBytes } from "crypto";
 import {
   AGENT_TEAM_SCHEMA,
   BUS,
@@ -10,6 +9,7 @@ import {
 import { BG, BG_TOOL_SCHEMA } from "../agent/background";
 import { getSkillLoader } from "../agent/skill";
 import { runSubagent } from "../agent/subagent";
+import { WORKTREES, EVENTS, WORKTREE_SCHEMA } from "../agent/worktree";
 import { BASH_TOOL_SCHEMA, runBash } from "./bash";
 import { editFile, FILE_TOOL_SCHEMA, readFile, writeFile } from "./file";
 import { TASK_OPERATIONS_SCHEMA, TASKS, TaskStatus } from "./task";
@@ -68,30 +68,44 @@ export const toolHandlers: Record<
   load_skill: ({ name }: { name: string }) => getSkillLoader().getContent(name),
   agent: ({ prompt }: { prompt: string }) => runSubagent(prompt),
 
-  // 创建新任务
+  // task
   task_create: ({
     subject,
     description,
+    owner,
   }: {
     subject: string;
     description: string;
-  }) => TASKS.create(subject, description),
+    owner: string;
+  }) => TASKS.create(subject, description, owner),
   task_update: ({
     task_id,
     status,
+    owner,
     addBlockedBy,
     addBlocks,
   }: {
     task_id: number;
     status: TaskStatus;
+    owner: string;
     addBlockedBy: number[];
     addBlocks: number[];
-  }) => TASKS.update(task_id, status, addBlockedBy, addBlocks),
-  // 列出所有任务
+  }) => TASKS.update(task_id, status, owner, addBlockedBy, addBlocks),
   task_list: () => TASKS.listAll(),
   task_get: ({ task_id }: { task_id: number }) => TASKS.get(task_id),
+  task_bind_worktree: ({
+    task_id,
+    worktree,
+    owner,
+  }: {
+    task_id: number;
+    worktree: string;
+    owner: string;
+  }) => TASKS.bindWorktree(task_id, worktree, owner),
+  claim_task: ({ task_id }: { task_id: number }) =>
+    TASKS.claimTask(task_id, "lead"),
 
-  // 后台运行命令
+  // background
   background_run: ({ command }: { command: string }) => BG.run(command),
   check_background: ({ task_id }: { task_id: string }) => BG.check(task_id),
 
@@ -110,6 +124,33 @@ export const toolHandlers: Record<
   force_shutdown: ({ teammate }) => TEAM.forceShutdown(teammate),
   plan_approval: ({ request_id, approve, feedback }) =>
     handlePlanReview(request_id, approve, feedback),
+
+  // worktree
+  worktree_create: ({
+    name,
+    task_id,
+    base_ref,
+  }: {
+    name: string;
+    task_id: number;
+    base_ref: string;
+  }) => WORKTREES.create(name, task_id ?? null, base_ref || "HEAD"),
+  worktree_list: () => WORKTREES.listAll(),
+  worktree_status: ({ name }: { name: string }) => WORKTREES.status(name),
+  worktree_run: ({ name, command }: { name: string; command: string }) =>
+    WORKTREES.run(name, command),
+  worktree_remove: ({
+    name,
+    force,
+    complete_task,
+  }: {
+    name: string;
+    force: boolean;
+    complete_task: boolean;
+  }) => WORKTREES.remove(name, force, complete_task),
+  worktree_keep: ({ name }: { name: string }) => WORKTREES.keep(name),
+  worktree_events: ({ limit }: { limit: number }) =>
+    EVENTS.listRecent(limit),
 };
 
 export const baseTools = [
@@ -121,9 +162,10 @@ export const baseTools = [
 export const mainAgentTools = [
   ...baseTools,
   ...AGENT_TEAM_SCHEMA,
+  ...WORKTREE_SCHEMA,
+  ...TASK_OPERATIONS_SCHEMA,
   AGENT_TOOL_SCHEMA,
   ...BG_TOOL_SCHEMA,
-  ...TASK_OPERATIONS_SCHEMA,
   COMPACT_TOOL_SCHEMA,
 ];
 

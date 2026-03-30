@@ -2,35 +2,32 @@
 
 ## 概述
 
-`agentTeam.ts` 实现了一个 **多 Agent 协作系统**，允许主 Agent（Lead）动态生成（spawn）多个子 Agent（称为 teammate），这些 teammate 各自独立运行，通过基于文件的消息总线（MessageBus）进行异步通信。
+`agentTeam.ts` 实现了一个 **自治型多 Agent 协作系统**，允许主 Agent（Lead）动态生成（spawn）多个自治子 Agent（teammate）。teammate 不仅能接受 lead 指派的任务，还能**自主扫描任务看板、认领未分配的任务**，实现真正的自组织。
 
-系统内置两套治理协议：
-- **Plan Approval 协议** — 事前控制，teammate 在执行重大工作前需提交计划，等待 lead 审批
-- **Shutdown 协议** — 事后控制，lead 可向 teammate 发起优雅关闭请求，teammate 可接受或拒绝
+核心能力：
+- **自治循环** — teammate 完成工作后进入 idle 轮询阶段，自动从任务看板认领新任务
+- **消息总线** — 基于 JSONL 文件的异步通信（MessageBus）
+- **治理协议** — Plan Approval（事前审批）+ 两级 Shutdown（优雅请求 / 强制终止）
+- **身份重注入** — 上下文压缩后自动恢复 teammate 的身份信息
 
-两套协议均基于 `request_id` 关联机制，使异步消息总线具备请求-响应追踪能力。
-
-整体架构如下：
+整体架构：
 
 ```
-┌─────────────┐     spawn      ┌──────────────┐
-│  Lead Agent │ ──────────────▶│ Teammate A   │
-│             │  plan_approval │ (role: coder)│
-│             │ ◀──────────────│              │
-│             │  approve/reject│              │
-│             │ ──────────────▶│              │
+┌─────────────┐     spawn      ┌──────────────┐     scan/claim    ┌──────────────┐
+│  Lead Agent │ ──────────────▶│ Teammate A   │ ◀──────────────── │  Task Board  │
+│             │  plan_approval │ (autonomous) │                   │  (.tasks/)   │
+│             │ ◀──────────────│              │                   └──────────────┘
 │             │                └──────┬───────┘
-│             │  shutdown_request     │ send_message
-│             │ ──────────────▶       ▼
+│             │                       │ send_message / idle / claim_task
+│             │                       ▼
 │             │                ┌──────────────┐
 │             │                │  MessageBus  │  ← 基于 JSONL 文件
 │             │                │  (.inbox/)   │
 │             │                └──────┬───────┘
-│             │  shutdown_response    │ readInbox
-│             │ ◀──────────────       ▼
+│             │                       │
 │             │                ┌──────────────┐
 │             │                │ Teammate B   │
-│             │                │ (role: reviewer)
+│             │                │ (autonomous) │
 └─────────────┘                └──────────────┘
 ```
 
@@ -38,12 +35,13 @@
 
 ## 目录结构
 
-运行时会在工作目录下自动创建两个隐藏目录：
+运行时会在工作目录下自动创建以下隐藏目录：
 
 | 目录 | 用途 |
 |------|------|
 | `.inbox/` | 消息总线存储目录，每个 agent 一个 `{name}.jsonl` 文件作为收件箱 |
 | `.team/` | 团队配置目录，包含 `config.json` 记录所有成员信息 |
+| `.tasks/` | 任务看板目录，每个任务一个 `task_{id}.json` 文件（由 `task.ts` 管理） |
 
 ---
 
@@ -74,7 +72,7 @@
   timestamp: number;      // 时间戳（毫秒）
   request_id?: string;    // 请求关联 ID（shutdown/plan_approval 场景）
   approve?: boolean;      // 是否批准（shutdown_response 场景）
-  plan?: string;          // 计划内容（plan_approval_response 场景）
+  plan?: string;          // 计划内容（plan_submission 场景）
   [key: string]: unknown; // 其他扩展字段
 }
 ```
@@ -95,14 +93,14 @@
 
 ## 全局状态与常量
 
-### 重试配置
+### 自治循环配置
 
 ```ts
-const MAX_RETRIES = 2;       // API 调用最大重试次数
-const RETRY_DELAY_MS = 2000; // 重试基础延迟（毫秒），按次数递增
+const MAX_RETRIES = 2;        // API 调用最大重试次数
+const RETRY_DELAY_MS = 2000;  // 重试基础延迟（毫秒），按次数递增
+const POLL_INTERVAL = 5000;   // idle 阶段轮询间隔（毫秒）
+const IDLE_TIMEOUT = 60000;   // idle 阶段超时（毫秒），超时后自动 shutdown
 ```
-
-teammate 的 API 调用遇到 5xx 错误时会自动重试，延迟为 `RETRY_DELAY_MS * (retry + 1)`（递增退避）。
 
 ### shutdownRequests
 
@@ -165,7 +163,7 @@ const planRequests: Record<string, { from: string; plan: string; status: string 
 
 ### 2. TeammateManager
 
-团队管理器，负责 teammate 的生命周期管理和任务执行。
+团队管理器，负责 teammate 的自治生命周期管理。
 
 #### 配置持久化
 
@@ -186,7 +184,8 @@ const planRequests: Record<string, { from: string; plan: string; status: string 
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `spawn` | `(name, role, prompt) → string` | 创建或重启一个 teammate，启动其 agentic loop |
+| `spawn` | `(name, role, prompt) → string` | 创建或重启一个 teammate，启动自治循环 |
+| `forceShutdown` | `(name) → string` | 强制终止指定 teammate |
 | `listAll` | `() → string` | 列出所有团队成员及其状态 |
 | `memberNames` | `() → string[]` | 返回所有成员名称数组 |
 
@@ -202,19 +201,21 @@ spawn("coder", "TypeScript developer", "实现登录功能")
   │
   ├─ 2. 更新状态为 "working"，保存配置
   │
-  └─ 3. 异步启动 _teammateLoop（fire-and-forget）
+  └─ 3. 异步启动 _loop，带 crash 处理
+        .catch → 记录错误日志，状态设为 "idle"
 ```
 
 ---
 
-### 3. _teammateLoop — Agentic 循环（核心）
+### 3. _loop — 自治循环（核心）
 
-这是每个 teammate 的主循环，实现了完整的 Agent 执行流程。
+这是每个 teammate 的主循环，实现 **work → idle → poll → work** 的自治闭环。
 
 #### System Prompt
 
 ```
-You are '{name}', role: {role}, at {WORKDIR}.
+You are '{name}', role: {role}, team: {teamName}, at {WORKDIR}.
+Use idle tool when you have no more work. You will auto-claim new tasks.
 
 MANDATORY PROTOCOLS — you MUST follow these without exception:
 1. Before starting any major work, you MUST call the plan_approval tool to submit
@@ -224,51 +225,91 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
    shutdown_response tool with the provided request_id.
 ```
 
-System prompt 以 **强制协议** 形式要求 teammate 遵守两套协议，明确禁止通过写文件或发消息等方式绕过 `plan_approval` 工具。
+System prompt 告知 teammate 它是自治的：完成工作后使用 `idle` 工具进入轮询，系统会自动分配新任务。
 
 #### 循环流程
 
 ```
-┌──────────────────────────────────────────────────────┐
-│              _teammateLoop                            │
-│                                                       │
-│  let shouldExit = false                               │
-│                                                       │
-│  for (最多 50 轮) {                                   │
-│    1. 读取收件箱 → 注入为 user message                │
-│    2. 如果 shouldExit == true → 跳出循环              │
-│    3. 调用 Claude API（带 tools，失败时重试）          │
-│       - 5xx 错误最多重试 MAX_RETRIES 次               │
-│       - 每次重试延迟递增（RETRY_DELAY_MS * n）        │
-│       - 非 5xx 错误或重试耗尽 → 退出循环              │
-│    4. 将 assistant response 加入历史                   │
-│    5. 如果 stop_reason ≠ "tool_use" → 结束            │
-│    6. 遍历 tool_use blocks：                          │
-│       - 执行工具（_exec）                              │
-│       - 收集 tool_result                              │
-│       - 如果是 shutdown_response 且 approve → 标记    │
-│         shouldExit = true                             │
-│    7. 将 tool_results 加入历史                        │
-│  }                                                    │
-│                                                       │
-│  循环结束 →                                           │
-│    shouldExit ? 状态设为 "shutdown"                    │
-│             : 状态设为 "idle"                          │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│                        _loop (外层 while true)                 │
+│                                                                │
+│  ┌─── Work Phase (内层 for, 最多 50 轮) ──────────────────┐   │
+│  │                                                         │   │
+│  │  1. 检查 _forceShutdowns → 命中则立即 return           │   │
+│  │  2. 读取收件箱                                          │   │
+│  │     - shutdown_request → 立即 return                    │   │
+│  │     - 其他消息 → 注入为 user message                    │   │
+│  │  3. 调用 Claude API（带 tools，5xx 自动重试）           │   │
+│  │  4. 将 assistant response 加入历史                      │   │
+│  │  5. 如果 stop_reason ≠ "tool_use" → break              │   │
+│  │  6. 遍历 tool_use blocks：                             │   │
+│  │     - idle → 标记 idleRequested = true                  │   │
+│  │     - 其他 → 执行工具（_exec），收集 tool_result        │   │
+│  │  7. 将 tool_results 加入历史                            │   │
+│  │  8. 如果 idleRequested → break                          │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           ↓                                    │
+│  ┌─── Idle Phase (轮询, 每 5s 一次, 最多 60s) ───────────┐   │
+│  │                                                         │   │
+│  │  状态设为 "idle"                                        │   │
+│  │                                                         │   │
+│  │  每轮轮询:                                              │   │
+│  │    1. 检查 _forceShutdowns → 命中则 return              │   │
+│  │    2. 读取收件箱                                        │   │
+│  │       - shutdown_request → return                       │   │
+│  │       - 有消息 → resume = true, break                   │   │
+│  │    3. 扫描任务看板 (TASKS.scanUnclaimed)                │   │
+│  │       - 有未认领任务 → claimTask + 身份重注入           │   │
+│  │       → resume = true, break                            │   │
+│  │                                                         │   │
+│  │  轮询结束:                                              │   │
+│  │    resume = true  → 状态设为 "working", 继续外层循环    │   │
+│  │    resume = false → idle 超时, 自动 shutdown, return    │   │
+│  │                                                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 #### 关键特性
 
-- **最大 50 轮迭代**：防止无限循环
-- **收件箱轮询**：每轮循环开始时检查收件箱，将新消息注入对话历史，实现 agent 间实时通信
-- **错误重试**：API 调用遇到 5xx 错误时自动重试（最多 `MAX_RETRIES` 次，递增延迟），非 5xx 错误或重试耗尽后记录日志并退出循环
-- **优雅关闭**：teammate approve shutdown 后，不会立即中断当前轮次，而是先处理完收件箱中的剩余消息，再在下一轮循环开始时退出
-- **状态区分**：退出时根据 `shouldExit` 标志明确区分 `"shutdown"`（被请求关闭）和 `"idle"`（自然结束），便于 lead 了解退出原因
-- **强制协议**：system prompt 以强制语气要求 teammate 必须通过 `plan_approval` 工具提交计划，禁止写文件或发消息绕过
+- **自治闭环**：work → idle → poll → work，无需 lead 持续干预
+- **任务自动认领**：idle 阶段扫描 `.tasks/` 目录，自动认领 `status=pending` 且无 `owner` 的任务
+- **身份重注入**：认领新任务时，如果消息历史很短（≤3 条，可能经过压缩），自动注入 `<identity>` 块恢复身份
+- **空闲超时**：`IDLE_TIMEOUT`（60 秒）内无新任务或消息，自动 shutdown，避免空转浪费
+- **最大 50 轮迭代**：单个 work phase 防止无限循环
+- **错误重试**：API 5xx 错误自动重试（最多 `MAX_RETRIES` 次，递增退避），并记录日志
+- **crash 恢复**：`_loop` 的 `.catch` 记录错误并将状态设为 `idle`（而非静默吞掉）
+- **强制协议**：system prompt 以强制语气要求 teammate 必须通过 `plan_approval` 工具提交计划
 
 ---
 
-### 4. _exec — 工具执行分发
+### 4. 身份重注入（makeIdentityBlock）
+
+解决的问题：上下文压缩（compact）后，消息历史被精简，teammate 可能丢失自身身份信息。
+
+```ts
+function makeIdentityBlock(name, role, teamName): MessageParam {
+  return {
+    role: "user",
+    content: `<identity>You are '${name}', role: ${role}, team: ${teamName}. Continue your work.</identity>`
+  };
+}
+```
+
+触发条件：`messages.length <= 3`（说明历史很短，可能刚被压缩）。此时在消息开头注入 identity 块 + assistant 确认。
+
+```
+注入后的消息历史:
+  [0] user:      <identity>You are 'coder', role: TS developer, team: default...</identity>
+  [1] assistant: I am coder. Continuing.
+  [2] user:      <auto-claimed>Task #3: 重构配置模块...</auto-claimed>
+  [3] assistant: Claimed task #3. Working on it.
+```
+
+---
+
+### 5. _exec — 工具执行分发
 
 将 Claude 返回的 tool_use 请求分发到具体的工具实现：
 
@@ -283,12 +324,19 @@ System prompt 以 **强制协议** 形式要求 teammate 遵守两套协议，�
 | `send_message` | 发送消息给队友 | `BUS.send(...)` |
 | `read_inbox` | 读取自己的收件箱 | `BUS.readInbox(...)` |
 
-#### 协议工具（新增）
+#### 自治工具
 
 | 工具名 | 功能 | 详细说明 |
 |--------|------|----------|
-| `shutdown_response` | 响应关闭请求 | 接收 `request_id` + `approve` + 可选 `reason`。更新 `shutdownRequests` 状态表，向 lead 发送 `shutdown_response` 类型消息（携带 `request_id` 和 `approve`）。如果 approve 为 true，teammate 将在下一轮循环退出 |
-| `plan_approval` | 提交工作计划 | 接收 `plan` 文本。自动生成 `request_id`（`randomBytes(4).toString("hex")`），在 `planRequests` 中记录状态为 `pending`，向 lead 发送 `plan_submission` 类型消息（携带 `request_id` 和 `plan`）。返回 `request_id` 供后续追踪 |
+| `idle` | 进入空闲阶段 | 不由 `_exec` 处理，在循环中特殊处理。返回提示信息后 break work phase |
+| `claim_task` | 手动认领任务 | 调用 `TASKS.claimTask(taskId, sender)`，将任务状态改为 `in_progress` |
+
+#### 协议工具
+
+| 工具名 | 功能 | 详细说明 |
+|--------|------|----------|
+| `shutdown_response` | 响应关闭请求 | 接收 `request_id` + `approve` + 可选 `reason`。更新 `shutdownRequests` 状态表，向 lead 发送 `shutdown_response` 类型消息 |
+| `plan_approval` | 提交工作计划 | 接收 `plan` 文本。自动生成 `request_id`，在 `planRequests` 中记录状态为 `pending`，向 lead 发送 `plan_submission` 类型消息 |
 
 ---
 
@@ -312,7 +360,7 @@ Lead Agent 通过以下工具管理团队：
 |--------|------|------|------|
 | `shutdown_request` | 请求 teammate 关闭 | `teammate` | 向指定 teammate 发送关闭请求，返回 `request_id` 用于追踪 |
 | `shutdown_response` | 查询关闭请求状态 | `request_id` | 通过 `request_id` 查询 teammate 是否已响应（approved/rejected） |
-| `force_shutdown` | 强制关闭 teammate | `teammate` | 绕过优雅关闭协议，在 teammate 下一轮循环迭代时立即终止。用于 teammate 拒绝 `shutdown_request` 后的兜底手段 |
+| `force_shutdown` | 强制关闭 teammate | `teammate` | 绕过优雅关闭协议，在 teammate 下一轮循环迭代时立即终止。支持 `working` 和 `idle` 状态 |
 | `plan_approval` | 审批 teammate 的计划 | `request_id`, `approve`, `feedback?` | 批准或拒绝 teammate 提交的工作计划，可附带反馈意见 |
 
 ---
@@ -321,7 +369,7 @@ Lead Agent 通过以下工具管理团队：
 
 ### Plan Approval 协议（计划审批）
 
-解决的问题：原来 teammate spawn 后自主行动，lead 无法在执行前审核方案，可能导致 teammate 做无用功或偏离方向。
+解决的问题：teammate 自主行动时，lead 无法在执行前审核方案，可能导致偏离方向。
 
 #### 完整流程
 
@@ -361,8 +409,6 @@ lead 拒绝         → planRequests[request_id].status = "rejected"
 
 ### Shutdown 协议（两级关闭）
 
-解决的问题：原来 teammate 只能自然结束（50 轮耗尽或模型不再调用工具），无法被 lead 主动、安全地停止。
-
 Lead 拥有两级关闭能力：
 
 | 级别 | 工具 | 性质 | teammate 可拒绝 |
@@ -370,154 +416,144 @@ Lead 拥有两级关闭能力：
 | L1 | `shutdown_request` | 优雅请求 | 是 |
 | L2 | `force_shutdown` | 强制终止 | 否 |
 
-#### L1：优雅关闭流程
+#### L1：优雅关闭
 
 ```
 ┌──────────┐                    ┌──────────────┐                    ┌──────────┐
 │  Lead    │                    │  MessageBus  │                    │ Teammate │
 └────┬─────┘                    └──────┬───────┘                    └────┬─────┘
-     │                                 │                                 │
      │  shutdown_request(teammate)     │                                 │
      │────────────────────────────────▶│────────────────────────────────▶│
-     │                                 │   生成 request_id               │
-     │  返回 request_id               │   shutdownRequests[id]=pending  │
-     │                                 │                                 │
-     │                                 │   （teammate 下一轮循环读取     │
-     │                                 │    收件箱，看到 shutdown_request）│
-     │                                 │                                 │
-     │                                 │   shutdown_response(            │
-     │                                 │     request_id, approve, reason)│
+     │  返回 request_id               │                                 │
+     │                                 │   shutdown_response(approve)    │
      │  read_inbox()                   │◀────────────────────────────────│
      │  ← shutdown_response            │                                 │
      │◀────────────────────────────────│                                 │
      │                                 │                                 │
-     │  （如果 approve = true）         │   shouldExit = true             │
-     │                                 │   → 下一轮循环退出              │
-     │                                 │   → 状态设为 "shutdown"         │
-     │                                 │                                 │
-     │  （如果 approve = false）        │   继续工作                      │
-     │                                 │   → 状态保持 "working"          │
-     │                                 │                                 │
-     │  ┌─ L2 升级（可选）─────────┐   │                                 │
-     │  │ force_shutdown(teammate) │   │                                 │
-     │  │ → 见下方 L2 流程         │   │                                 │
-     │  └──────────────────────────┘   │                                 │
+     │  approve=true  → teammate shutdown                               │
+     │  approve=false → teammate 继续工作                                │
+     │                 → lead 可升级为 force_shutdown                     │
 ```
 
-#### L2：强制关闭流程
-
-当 teammate 拒绝 `shutdown_request` 后，lead 可升级为 `force_shutdown`：
+#### L2：强制关闭
 
 ```
-┌──────────┐                                          ┌──────────┐
-│  Lead    │                                          │ Teammate │
-└────┬─────┘                                          └────┬─────┘
-     │                                                     │
-     │  force_shutdown("bob")                              │
-     │  → _forceShutdowns.add("bob")                       │
-     │  → 返回确认消息                                      │
-     │                                                     │
-     │                                     _teammateLoop 下一轮迭代:
-     │                                       检查 _forceShutdowns
-     │                                       → 命中，立即 break
-     │                                       → 状态设为 "shutdown"
-     │                                                     │
+Lead: force_shutdown("bob")
+  → _forceShutdowns.add("bob")
+  → teammate 在下一轮循环（work phase 或 idle phase）立即退出
+  → 状态设为 "shutdown"
 ```
 
 **实现机制：**
 
-- `TeammateManager` 维护一个内存集合 `_forceShutdowns: Set<string>`
-- `forceShutdown(name)` 方法校验 teammate 状态为 `working` 后，将其加入集合
-- `_teammateLoop` 每轮迭代**最先**检查 `_forceShutdowns`（优先于收件箱读取），命中则立即退出
+- `TeammateManager` 维护内存集合 `_forceShutdowns: Set<string>`
+- `forceShutdown(name)` 校验 teammate 状态为 `working` 或 `idle` 后加入集合
+- `_loop` 的 work phase 和 idle phase **都**检查 `_forceShutdowns`，命中则立即 return
 - 不经过消息总线，不依赖模型行为，lead 单方面生效
 
 #### 状态流转
 
 ```
 lead 发起关闭   → shutdownRequests[request_id].status = "pending"
-teammate 同意   → shutdownRequests[request_id].status = "approved"
-                  shouldExit = true → 优雅退出 → member.status = "shutdown"
-teammate 拒绝   → shutdownRequests[request_id].status = "rejected"
-                  继续工作 → member.status 保持 "working"
-lead 强制关闭   → _forceShutdowns.add(name)
-                  → 下一轮迭代立即退出 → member.status = "shutdown"
+teammate 同意   → "approved" → member.status = "shutdown"
+teammate 拒绝   → "rejected" → member.status 保持 "working"
+lead 强制关闭   → _forceShutdowns.add(name) → member.status = "shutdown"
+idle 超时       → 自动 shutdown → member.status = "shutdown"
 ```
 
-#### 优雅退出细节（L1 approve 场景）
+---
 
-teammate approve shutdown 后的退出顺序：
+## Teammate 生命周期
 
-1. `_exec` 返回 `"Shutdown approved"`，`shouldExit` 标记为 `true`
-2. 当前轮次的其他 tool_use 继续正常执行（不中断）
-3. 当前轮次的 tool_results 正常写入消息历史
-4. 下一轮循环开始时，先读取收件箱（处理可能的剩余消息）
-5. 检测到 `shouldExit === true`，跳出循环
-6. 状态设为 `"shutdown"`，写入配置
-
-#### 强制退出细节（L2 场景）
-
-1. `_forceShutdowns` 检查在收件箱读取**之前**，确保不会再执行任何工具
-2. 当前正在执行的 API 调用/工具会完成（无法中断进行中的操作），但不会发起新的调用
-3. 状态直接设为 `"shutdown"`，写入配置
+```
+                    spawn(name, role, prompt)
+                           │
+                           ▼
+                    ┌──────────────┐
+          ┌────────│   working     │◀──────────────────┐
+          │        └──────┬───────┘                    │
+          │               │                             │
+          │    idle tool / end_turn / 50 轮耗尽         │ 收到消息 / 认领任务
+          │               │                             │
+          │               ▼                             │
+          │        ┌──────────────┐                     │
+          │        │    idle      │─────────────────────┘
+          │        └──────┬───────┘
+          │               │
+          │        60 秒无任务/消息
+          │               │
+          ▼               ▼
+   ┌──────────────────────────────┐
+   │         shutdown             │
+   │  (shutdown_request /         │
+   │   force_shutdown /           │
+   │   idle timeout /             │
+   │   API error)                 │
+   └──────────────────────────────┘
+```
 
 ---
 
 ## 完整交互示例
 
-### 示例 1：基础工作流（含计划审批）
+### 示例 1：自治工作流（自动认领任务）
 
 ```
 Lead 调用:
-  TEAM.spawn("frontend", "React developer", "用 React 实现一个 TodoList 组件")
+  task_create("实现用户注册 API")        → task #1
+  task_create("编写注册接口单元测试")     → task #2
+  TEAM.spawn("backend", "Node.js developer", "你是后端开发者，查看任务看板开始工作")
 
-→ TeammateManager:
-    创建成员 { name: "frontend", role: "React developer", status: "working" }
-    启动 _teammateLoop
+→ _loop Work Phase 第 1 轮:
+    Claude 看到 prompt，调用 claim_task(task_id=1)
+    执行: TASKS.claimTask(1, "backend") → task #1 owner=backend, status=in_progress
 
-→ _teammateLoop 第 1 轮:
-    Claude API 返回: tool_use [plan_approval: "1. 创建 TodoList 组件 2. 添加增删功能 3. 样式美化"]
-    执行: plan_approval → 生成 request_id="a1b2c3d4"
-    向 lead 收件箱发送 plan_submission
-    返回: "Plan submitted (request_id=a1b2c3d4). Waiting for lead approval."
+→ _loop Work Phase 第 2 轮:
+    Claude 调用 plan_approval(plan="1. 创建路由 2. 实现控制器 3. 添加验证")
+    向 lead 发送 plan_submission
+    等待审批...
 
 → Lead:
     read_inbox() → 收到 plan_submission
-    plan_approval(request_id="a1b2c3d4", approve=true, feedback="先做核心功能，样式放后面")
+    plan_approval(request_id="a1b2c3d4", approve=true)
 
-→ _teammateLoop 第 2 轮:
-    收件箱收到 lead 的审批结果
-    Claude API 返回: tool_use [write_file: src/TodoList.tsx]
-    执行: writeFile("src/TodoList.tsx", "...")
-    继续循环
+→ _loop Work Phase 后续轮次:
+    收到审批通过，开始编码
+    完成后调用 idle 工具
+    → 进入 Idle Phase
 
-→ _teammateLoop 第 3 轮:
-    Claude API 返回: end_turn（无 tool_use）
-    循环结束，状态设为 "idle"
+→ _loop Idle Phase:
+    每 5 秒轮询一次
+    第 2 次轮询: scanUnclaimed() → 发现 task #2
+    自动认领: claimTask(2, "backend")
+    身份重注入（如果消息历史很短）
+    → 回到 Work Phase，开始处理 task #2
+
+→ _loop Idle Phase（task #2 完成后）:
+    60 秒内无新任务
+    → 自动 shutdown
 ```
 
-### 示例 2：优雅关闭
+### 示例 2：多 teammate 并行
 
 ```
 Lead 调用:
-  shutdown_request(teammate="frontend")
-  → 向 frontend 收件箱发送 shutdown_request 消息
-  → 返回 request_id="e5f6g7h8"
+  task_create("重构用户模块")       → task #1
+  task_create("重构订单模块")       → task #2
+  TEAM.spawn("alice", "developer", "查看任务看板开始工作")
+  TEAM.spawn("bob", "developer", "查看任务看板开始工作")
 
-→ _teammateLoop（frontend）下一轮:
-    收件箱读到 shutdown_request 消息
-    Claude 判断当前无未完成工作
-    Claude API 返回: tool_use [shutdown_response: { request_id: "e5f6g7h8", approve: true, reason: "任务已完成" }]
-    执行: shutdown_response → shutdownRequests["e5f6g7h8"].status = "approved"
-    shouldExit = true
+→ alice 的 _loop:
+    claim_task(1) → 认领 task #1
+    在主工作目录修改文件...
 
-→ _teammateLoop 下一轮:
-    读取收件箱（处理剩余消息）
-    shouldExit === true → 跳出循环
-    状态设为 "shutdown"
+→ bob 的 _loop:
+    claim_task(1) → Error: Task #1 already owned by alice（锁机制）
+    claim_task(2) → 认领 task #2
+    在主工作目录修改文件...
 
-→ Lead:
-    read_inbox() → 收到 shutdown_response（approve: true, reason: "任务已完成"）
-    确认 frontend 已关闭
+注意: 此场景下如果两人修改同一文件会冲突，
+需配合 worktree 隔离（见 worktree.md）
 ```
 
 ### 示例 3：拒绝关闭 → 强制关闭
@@ -527,41 +563,38 @@ Lead 调用:
   shutdown_request(teammate="backend")
   → 返回 request_id="x1y2z3w4"
 
-→ _teammateLoop（backend）下一轮:
-    收件箱读到 shutdown_request 消息
-    Claude 判断当前还有未完成的数据库迁移
-    Claude API 返回: tool_use [shutdown_response: { request_id: "x1y2z3w4", approve: false, reason: "数据库迁移进行中，预计还需 2 轮" }]
-    执行: shutdown_response → shutdownRequests["x1y2z3w4"].status = "rejected"
-    shouldExit 保持 false，继续工作
+→ _loop（backend）Work Phase:
+    收件箱读到 shutdown_request → 立即 shutdown（自治模式下直接退出）
 
-→ Lead:
-    read_inbox() → 收到 shutdown_response（approve: false, reason: "数据库迁移进行中..."）
-
-    方案 A — 等待: 决定等 backend 完成后再次请求关闭
-    方案 B — 强制: 调用 force_shutdown(teammate="backend")
-
-→ Lead 选择方案 B:
-    force_shutdown("backend")
-    → _forceShutdowns.add("backend")
-    → 返回 "Force shutdown issued for 'backend'. Will terminate at next loop iteration."
-
-→ _teammateLoop（backend）下一轮:
-    检查 _forceShutdowns → 命中 "backend"
-    立即跳出循环，不再读取收件箱或调用 API
-    状态设为 "shutdown"
+或者（如果需要 lead 强制介入）:
+  force_shutdown("backend")
+  → _forceShutdowns.add("backend")
+  → backend 在下一轮循环立即退出
 ```
+
+---
+
+## 与 Task 系统的集成
+
+teammate 通过 `TASKS`（来自 `task.ts`）与任务看板交互：
+
+| 调用 | 场景 |
+|------|------|
+| `TASKS.scanUnclaimed()` | idle 阶段自动扫描未认领任务 |
+| `TASKS.claimTask(id, name)` | 认领任务（带锁防并发冲突） |
+| `claim_task` 工具 | teammate 手动认领指定任务 |
+
+任务认领条件：`status === "pending"` 且 `owner` 为空 且 `blockedBy` 为空。
 
 ---
 
 ## 导出
 
 ```ts
-export const AGENT_TEAM_SCHEMA = [...];  // Lead 侧工具定义
+export const AGENT_TEAM_SCHEMA = [...];  // Lead 侧工具定义（7 个）
 export const BUS = new MessageBus(INBOX_DIR);  // 消息总线单例
 export const TEAM = new TeammateManager(TEAM_DIR);  // 团队管理器单例
+export const shutdownRequests = {...};  // 关闭请求状态表
+export const planRequests = {...};  // 计划审批状态表
+export { handleShutdownRequest, handlePlanReview };  // 协议处理函数
 ```
-
-模块导出三个核心对象：
-- `AGENT_TEAM_SCHEMA`：供主 Agent 注册 lead 侧工具
-- `BUS`：消息总线，供外部模块直接发送/读取消息
-- `TEAM`：团队管理器，供主 Agent 调用 `TEAM.spawn()`、`TEAM.listAll()` 等方法

@@ -12,6 +12,7 @@ import type { Model } from "@anthropic-ai/sdk/resources";
 import { getClient } from "./client";
 import { runBash } from "../tools/bash";
 import { writeFile, editFile } from "../tools/file";
+import { TASKS } from "../tools/task";
 
 const WORKDIR = process.cwd();
 const INBOX_DIR = join(WORKDIR, ".inbox");
@@ -20,6 +21,15 @@ const MODEL = (process.env["MODEL_ID"] ?? "claude-sonnet-4-20250514") as Model;
 
 const debug = (...args: unknown[]) =>
   process.stderr.write(`[debug] ${args.join(" ")}\n`);
+
+// --- Constants ---
+
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 2000;
+const POLL_INTERVAL = 5000;
+const IDLE_TIMEOUT = 60000;
+
+// --- Protocol state ---
 
 export const shutdownRequests: Record<string, { target: string; status: string }> = {};
 export const planRequests: Record<
@@ -65,9 +75,6 @@ const VALID_MSG_TYPES = new Set([
   "plan_submission",
   "plan_approval_response",
 ] as const);
-
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 2000;
 
 export const AGENT_TEAM_SCHEMA = [
   {
@@ -165,6 +172,19 @@ interface TeamConfig {
 
 type ToolInput = Record<string, string>;
 
+// --- Identity re-injection (survives context compression) ---
+
+function makeIdentityBlock(
+  name: string,
+  role: string,
+  teamName: string,
+): Anthropic.MessageParam {
+  return {
+    role: "user",
+    content: `<identity>You are '${name}', role: ${role}, team: ${teamName}. Continue your work.</identity>`,
+  };
+}
+
 // --- MessageBus: JSONL-based inbox system for agent communication ---
 
 class MessageBus {
@@ -223,7 +243,7 @@ class MessageBus {
 
 export const BUS = new MessageBus(INBOX_DIR);
 
-// --- TeammateManager: manages team members, supports spawn and messaging ---
+// --- TeammateManager: autonomous agent lifecycle ---
 
 class TeammateManager {
   private dir: string;
@@ -252,6 +272,14 @@ class TeammateManager {
     return this.config.members.find((m) => m.name === name);
   }
 
+  private _setStatus(name: string, status: TeamMember["status"]): void {
+    const member = this._findMember(name);
+    if (member) {
+      member.status = status;
+      this._saveConfig();
+    }
+  }
+
   spawn(name: string, role: string, prompt: string): string {
     let member = this._findMember(name);
     if (member) {
@@ -264,19 +292,26 @@ class TeammateManager {
       this.config.members.push(member);
     }
     this._saveConfig();
-    debug(`Spawned teammate '${name}' with role '${role}'`);
+    debug(`Spawned autonomous teammate '${name}' with role '${role}'`);
 
-    this._teammateLoop(name, role, prompt).catch(() => {});
+    this._loop(name, role, prompt).catch((e) => {
+      debug(`[${name}] Loop crashed: ${e?.message}`);
+      this._setStatus(name, "idle");
+    });
     return `Spawned '${name}' (role: ${role})`;
   }
 
-  private async _teammateLoop(
+  // --- Autonomous loop: work → idle → poll → work ---
+
+  private async _loop(
     name: string,
     role: string,
     prompt: string,
   ): Promise<void> {
     const client = getClient();
-    const sysPrompt = `You are '${name}', role: ${role}, at ${WORKDIR}.
+    const teamName = this.config.team_name;
+    const sysPrompt = `You are '${name}', role: ${role}, team: ${teamName}, at ${WORKDIR}.
+Use idle tool when you have no more work. You will auto-claim new tasks.
 
 MANDATORY PROTOCOLS — you MUST follow these without exception:
 1. Before starting any major work, you MUST call the plan_approval tool to submit your plan. NEVER write plans to files or send them as messages — only use the plan_approval tool. Wait for lead approval before proceeding.
@@ -285,72 +320,152 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
       { role: "user", content: prompt },
     ];
     const tools = this._teammateTools();
-    let shouldExit = false;
 
-    for (let i = 0; i < 50; i++) {
-      if (this._forceShutdowns.has(name)) {
-        this._forceShutdowns.delete(name);
-        debug(`[${name}] Force shutdown triggered, exiting loop`);
-        shouldExit = true;
-        break;
-      }
-      const inbox = BUS.readInbox(name);
-      for (const msg of inbox)
-        messages.push({ role: "user", content: JSON.stringify(msg) });
-      if (shouldExit) break;
+    // Outer loop: work phase → idle phase → repeat
+    while (true) {
+      // --- Work phase (max 50 turns) ---
+      for (let i = 0; i < 50; i++) {
+        // Force shutdown check (highest priority)
+        if (this._forceShutdowns.has(name)) {
+          this._forceShutdowns.delete(name);
+          debug(`[${name}] Force shutdown triggered`);
+          this._setStatus(name, "shutdown");
+          return;
+        }
 
-      let response: Anthropic.Message | undefined;
-      for (let retry = 0; retry <= MAX_RETRIES; retry++) {
-        try {
-          response = await client.messages.create({
-            model: MODEL,
-            system: sysPrompt,
-            messages,
-            tools,
-            max_tokens: 8000,
-          });
-          break;
-        } catch (e: any) {
-          const status = e?.status ?? e?.error?.status;
-          debug(`[${name}] API error (attempt ${retry + 1}/${MAX_RETRIES + 1}): ${e.message}`);
-          if (status >= 500 && retry < MAX_RETRIES) {
-            await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * (retry + 1)));
-            continue;
+        // Read inbox
+        const inbox = BUS.readInbox(name);
+        for (const msg of inbox) {
+          if (msg.type === "shutdown_request") {
+            // Direct shutdown for autonomous agents
+            this._setStatus(name, "shutdown");
+            return;
           }
+          messages.push({ role: "user", content: JSON.stringify(msg) });
+        }
+
+        // API call with retry
+        let response: Anthropic.Message | undefined;
+        for (let retry = 0; retry <= MAX_RETRIES; retry++) {
+          try {
+            response = await client.messages.create({
+              model: MODEL,
+              system: sysPrompt,
+              messages,
+              tools,
+              max_tokens: 8000,
+            });
+            break;
+          } catch (e: any) {
+            const status = e?.status ?? e?.error?.status;
+            debug(
+              `[${name}] API error (attempt ${retry + 1}/${MAX_RETRIES + 1}): ${e.message}`,
+            );
+            if (status >= 500 && retry < MAX_RETRIES) {
+              await new Promise((r) =>
+                setTimeout(r, RETRY_DELAY_MS * (retry + 1)),
+              );
+              continue;
+            }
+            break;
+          }
+        }
+        if (!response) {
+          this._setStatus(name, "idle");
+          return;
+        }
+
+        messages.push({ role: "assistant", content: response.content });
+        if (response.stop_reason !== "tool_use") break;
+
+        // Execute tools
+        const results: Anthropic.ToolResultBlockParam[] = [];
+        let idleRequested = false;
+
+        for (const block of response.content) {
+          if (block.type === "tool_use") {
+            let output: string;
+            if (block.name === "idle") {
+              idleRequested = true;
+              output = "Entering idle phase. Will poll for new tasks.";
+            } else {
+              output = this._exec(name, block.name, block.input as ToolInput);
+            }
+            console.log(
+              `  [${name}] ${block.name}: ${String(output).slice(0, 120)}`,
+            );
+            results.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: String(output),
+            });
+          }
+        }
+        messages.push({ role: "user", content: results });
+        if (idleRequested) break;
+      }
+
+      // --- Idle phase: poll inbox + task board ---
+      this._setStatus(name, "idle");
+      let resume = false;
+      const polls = Math.floor(IDLE_TIMEOUT / POLL_INTERVAL);
+
+      for (let p = 0; p < polls; p++) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+
+        // Force shutdown during idle
+        if (this._forceShutdowns.has(name)) {
+          this._forceShutdowns.delete(name);
+          debug(`[${name}] Force shutdown during idle`);
+          this._setStatus(name, "shutdown");
+          return;
+        }
+
+        // Check inbox
+        const inbox = BUS.readInbox(name);
+        if (inbox.length) {
+          for (const msg of inbox) {
+            if (msg.type === "shutdown_request") {
+              this._setStatus(name, "shutdown");
+              return;
+            }
+            messages.push({ role: "user", content: JSON.stringify(msg) });
+          }
+          resume = true;
+          break;
+        }
+
+        // Scan task board for unclaimed tasks
+        const unclaimed = TASKS.scanUnclaimed();
+        if (unclaimed.length) {
+          const task = unclaimed[0];
+          TASKS.claimTask(task.id, name);
+          const taskPrompt = `<auto-claimed>Task #${task.id}: ${task.subject}\n${task.description || ""}</auto-claimed>`;
+          // Identity re-injection after potential compression
+          if (messages.length <= 3) {
+            messages.unshift(makeIdentityBlock(name, role, teamName));
+            messages.splice(1, 0, {
+              role: "assistant",
+              content: `I am ${name}. Continuing.`,
+            });
+          }
+          messages.push({ role: "user", content: taskPrompt });
+          messages.push({
+            role: "assistant",
+            content: `Claimed task #${task.id}. Working on it.`,
+          });
+          resume = true;
           break;
         }
       }
-      if (!response) break;
 
-      messages.push({ role: "assistant", content: response.content });
-      if (response.stop_reason !== "tool_use") break;
-
-      const results: Anthropic.ToolResultBlockParam[] = [];
-      for (const block of response.content) {
-        if (block.type === "tool_use") {
-          const output = this._exec(name, block.name, block.input as ToolInput);
-          console.log(
-            `  [${name}] ${block.name}: ${String(output).slice(0, 120)}`,
-          );
-          results.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: String(output),
-          });
-          if (
-            block.name === "shutdown_response" &&
-            (block.input as ToolInput).approve
-          )
-            shouldExit = true;
-        }
+      if (!resume) {
+        // Idle timeout — auto shutdown
+        debug(`[${name}] Idle timeout, shutting down`);
+        this._setStatus(name, "shutdown");
+        return;
       }
-      messages.push({ role: "user", content: results });
-    }
-
-    const member = this._findMember(name);
-    if (member) {
-      member.status = shouldExit ? "shutdown" : "idle";
-      this._saveConfig();
+      this._setStatus(name, "working");
     }
   }
 
@@ -358,8 +473,8 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
     if (toolName === "bash") return runBash(args.command);
     if (toolName === "read_file") {
       try {
-        const lines = readFileSync(args.path, "utf8");
-        return lines.slice(0, 50000);
+        const content = readFileSync(args.path, "utf8");
+        return content.slice(0, 50000);
       } catch (e: any) {
         return `Error: ${e.message}`;
       }
@@ -376,6 +491,8 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
       );
     if (toolName === "read_inbox")
       return JSON.stringify(BUS.readInbox(sender), null, 2);
+    if (toolName === "claim_task")
+      return TASKS.claimTask(parseInt(args.task_id), sender);
     if (toolName === "shutdown_response") {
       const reqId = args.request_id;
       const approve = args.approve === "true";
@@ -467,6 +584,21 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
         input_schema: { type: "object" as const, properties: {} },
       },
       {
+        name: "idle",
+        description:
+          "Signal that you have no more work. Enters idle polling phase — will auto-claim new tasks.",
+        input_schema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "claim_task",
+        description: "Claim a task from the task board by ID.",
+        input_schema: {
+          type: "object" as const,
+          properties: { task_id: { type: "integer" } },
+          required: ["task_id"],
+        },
+      },
+      {
         name: "shutdown_response",
         description:
           "Respond to a shutdown request. Approve to shut down, reject to keep working.",
@@ -495,7 +627,8 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
   forceShutdown(name: string): string {
     const member = this._findMember(name);
     if (!member) return `Error: Unknown teammate '${name}'`;
-    if (member.status !== "working") return `Error: '${name}' is not working (status: ${member.status})`;
+    if (member.status !== "working" && member.status !== "idle")
+      return `Error: '${name}' is not active (status: ${member.status})`;
     this._forceShutdowns.add(name);
     debug(`Force shutdown issued for '${name}'`);
     return `Force shutdown issued for '${name}'. Will terminate at next loop iteration.`;
@@ -505,7 +638,9 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
     if (!this.config.members.length) return "No teammates.";
     const lines = [
       `Team: ${this.config.team_name}`,
-      ...this.config.members.map((m) => `  ${m.name} (${m.role}): ${m.status}`),
+      ...this.config.members.map(
+        (m) => `  ${m.name} (${m.role}): ${m.status}`,
+      ),
     ];
     return lines.join("\n");
   }
