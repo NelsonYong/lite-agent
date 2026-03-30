@@ -1,4 +1,12 @@
-import { AGENT_TEAM_SCHEMA, BUS, TEAM } from "../agent/agentTeam";
+import { randomBytes } from "crypto";
+import {
+  AGENT_TEAM_SCHEMA,
+  BUS,
+  handlePlanReview,
+  handleShutdownRequest,
+  shutdownRequests,
+  TEAM,
+} from "../agent/agentTeam";
 import { BG, BG_TOOL_SCHEMA } from "../agent/background";
 import { getSkillLoader } from "../agent/skill";
 import { runSubagent } from "../agent/subagent";
@@ -95,6 +103,12 @@ export const toolHandlers: Record<
   read_inbox: () => JSON.stringify(BUS.readInbox("lead"), null, 2),
   broadcast: ({ content }) =>
     BUS.broadcast("lead", content, TEAM.memberNames()),
+
+  shutdown_request: ({ teammate }) => handleShutdownRequest(teammate),
+  shutdown_response: ({ request_id }) =>
+    JSON.stringify(shutdownRequests[request_id] || { error: "not found" }),
+  plan_approval: ({ request_id, approve, feedback }) =>
+    handlePlanReview(request_id, approve, feedback),
 };
 
 export const baseTools = [
