@@ -16,16 +16,27 @@ export async function liteAgent({
   messages: initialMessages,
   system,
   forceTool,
+  signal,
 }: {
   messages: MessageParam[];
   system?: string;
   forceTool?: string;
+  signal?: AbortSignal;
 }) {
   let messages = initialMessages;
   let lastInputTokens = 0;
   let roundsSinceTodo = 0;
 
   while (true) {
+    // ESC 中断检查
+    if (signal?.aborted) {
+      messages.push({
+        role: "assistant",
+        content: [{ type: "text", text: "[interrupted by user]" }],
+      });
+      return;
+    }
+
     // 每次调用 llm 都将 tool result 替换成标识符
     messages = microCompact(messages, lastInputTokens);
 
@@ -61,14 +72,29 @@ export async function liteAgent({
     }
 
     // 调用 llm
-    const response = await getClient().messages.create({
-      messages,
-      model: process.env["MODEL_ID"] as Model,
-      max_tokens: 8000,
-      system,
-      tools: mainAgentTools,
-      tool_choice: forceTool ? { type: "tool", name: forceTool } : undefined,
-    });
+    let response;
+    try {
+      response = await getClient().messages.create(
+        {
+          messages,
+          model: process.env["MODEL_ID"] as Model,
+          max_tokens: 8000,
+          system,
+          tools: mainAgentTools,
+          tool_choice: forceTool ? { type: "tool", name: forceTool } : undefined,
+        },
+        { signal },
+      );
+    } catch (e: any) {
+      if (signal?.aborted) {
+        messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: "[interrupted by user]" }],
+        });
+        return;
+      }
+      throw e;
+    }
     lastInputTokens = response.usage.input_tokens;
     messages.push({ role: "assistant", content: response.content });
 
@@ -80,6 +106,14 @@ export async function liteAgent({
 
     for (const block of response.content) {
       if (block.type !== "tool_use") continue;
+      if (signal?.aborted) {
+        results.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: "[interrupted by user]",
+        });
+        continue;
+      }
 
       const input = block.input as any;
       let output: string;

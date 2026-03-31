@@ -106,8 +106,10 @@ export const toolHandlers: Record<
     TASKS.claimTask(task_id, "lead"),
 
   // background
-  background_run: ({ command }: { command: string }) => BG.run(command),
+  background_run: ({ command, daemon }: { command: string; daemon?: boolean }) =>
+    BG.run(command, daemon),
   check_background: ({ task_id }: { task_id: string }) => BG.check(task_id),
+  stop_background: ({ task_id }: { task_id: string }) => BG.stop(task_id),
 
   // agent team
   spawn_teammate: ({ name, role, prompt }) => TEAM.spawn(name, role, prompt),

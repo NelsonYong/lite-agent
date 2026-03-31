@@ -92,11 +92,34 @@ async function main() {
       role: "user",
       content: query.replace("/todo", "").trim() || "Update todos.",
     });
-    await liteAgent({
-      messages: history,
-      system: SYSTEM,
-      forceTool,
-    });
+
+    // ESC 中断支持：暂停 readline，进入 raw mode 监听 ESC 键
+    const ac = new AbortController();
+    rl.pause();
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const onKey = (key: Buffer) => {
+      // ESC = 单独的 0x1b（排除方向键等多字节转义序列）
+      if (key[0] === 0x1b && key.length === 1) {
+        ac.abort();
+        console.log("\n\x1b[33m[ESC] 中断当前循环\x1b[0m");
+      }
+    };
+    process.stdin.on("data", onKey);
+
+    try {
+      await liteAgent({
+        messages: history,
+        system: SYSTEM,
+        forceTool,
+        signal: ac.signal,
+      });
+    } finally {
+      process.stdin.removeListener("data", onKey);
+      if (process.stdin.isTTY) process.stdin.setRawMode(false);
+      rl.resume();
+    }
 
     // 取出最后一个消息的 content
     const lastContent = history[history.length - 1].content;

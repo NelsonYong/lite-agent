@@ -78,6 +78,35 @@ const VALID_MSG_TYPES = new Set([
 
 export const AGENT_TEAM_SCHEMA = [
   {
+    name: "spawn_teammate",
+    description:
+      "Spawn an autonomous teammate. They work independently, auto-claim tasks from the task board, and communicate via inbox.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string",
+          description: "Unique name for the teammate (e.g. 'alice', 'bob')",
+        },
+        role: {
+          type: "string",
+          description:
+            "Role description (e.g. 'frontend-dev', 'backend-dev', 'researcher')",
+        },
+        prompt: {
+          type: "string",
+          description: "Initial task prompt for the teammate",
+        },
+      },
+      required: ["name", "role", "prompt"],
+    },
+  },
+  {
+    name: "list_teammates",
+    description: "List all teammates and their current status.",
+    input_schema: { type: "object" as const, properties: {} },
+  },
+  {
     name: "send_message",
     description: "Send a message to a teammate.",
     input_schema: {
@@ -296,7 +325,8 @@ class TeammateManager {
 
     this._loop(name, role, prompt).catch((e) => {
       debug(`[${name}] Loop crashed: ${e?.message}`);
-      this._setStatus(name, "idle");
+      this._setStatus(name, "shutdown");
+      BUS.send(name, "lead", `Crashed: ${e?.message}`, "message");
     });
     return `Spawned '${name}' (role: ${role})`;
   }
@@ -310,12 +340,36 @@ class TeammateManager {
   ): Promise<void> {
     const client = getClient();
     const teamName = this.config.team_name;
-    const sysPrompt = `You are '${name}', role: ${role}, team: ${teamName}, at ${WORKDIR}.
-Use idle tool when you have no more work. You will auto-claim new tasks.
+    const sysPrompt = `You are '${name}', role: ${role}, team: ${teamName}.
+Working directory: ${WORKDIR}
 
-MANDATORY PROTOCOLS — you MUST follow these without exception:
-1. Before starting any major work, you MUST call the plan_approval tool to submit your plan. NEVER write plans to files or send them as messages — only use the plan_approval tool. Wait for lead approval before proceeding.
-2. When you receive a shutdown_request message, you MUST respond using the shutdown_response tool with the provided request_id.`;
+## Your Tools
+You have these tools — use them directly, NEVER run tool names as bash commands:
+- **bash**: Run shell commands (e.g. bash with command "ls -la")
+- **read_file**: Read file contents (path)
+- **write_file**: Write content to a file (path, content)
+- **edit_file**: Replace text in a file (path, old_text, new_text)
+- **send_message**: Send message to lead or another teammate (to, content)
+- **read_inbox**: Check your inbox for messages
+- **task_list**: List all tasks on the board with status and owner
+- **task_update**: Update task status (task_id, status: pending/in_progress/completed)
+- **claim_task**: Claim an unowned task from the task board (task_id)
+- **idle**: Signal you have no more work — enters idle polling phase
+- **plan_approval**: Submit a plan for lead approval (plan)
+- **shutdown_response**: Respond to a shutdown request (request_id, approve)
+
+## Workflow
+1. First call task_list to see if you have assigned tasks
+2. Submit a plan via plan_approval tool, then WAIT for approval before doing major work
+3. Execute the plan using bash, read_file, write_file, edit_file
+4. When a task is done, call task_update to mark it as completed
+5. Check task_list again for more assigned/unclaimed tasks
+6. When no more work remains, call idle to enter idle phase (you will auto-claim new tasks)
+
+## MANDATORY PROTOCOLS
+1. Before starting any major work, you MUST call the plan_approval tool. NEVER write plans to files or messages — only use the tool. Wait for lead approval.
+2. When you receive a shutdown_request, you MUST respond using shutdown_response with the provided request_id.
+3. NEVER run tool names as bash commands. "task_list" is NOT a bash command — use the appropriate tool.`;
     const messages: Anthropic.MessageParam[] = [
       { role: "user", content: prompt },
     ];
@@ -330,6 +384,7 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           this._forceShutdowns.delete(name);
           debug(`[${name}] Force shutdown triggered`);
           this._setStatus(name, "shutdown");
+          BUS.send(name, "lead", `'${name}' has been force-shutdown.`, "message");
           return;
         }
 
@@ -339,6 +394,7 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           if (msg.type === "shutdown_request") {
             // Direct shutdown for autonomous agents
             this._setStatus(name, "shutdown");
+            BUS.send(name, "lead", `'${name}' shut down (graceful request).`, "message");
             return;
           }
           messages.push({ role: "user", content: JSON.stringify(msg) });
@@ -371,7 +427,8 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           }
         }
         if (!response) {
-          this._setStatus(name, "idle");
+          this._setStatus(name, "shutdown");
+          BUS.send(name, "lead", `'${name}' shut down: API call failed after retries.`, "message");
           return;
         }
 
@@ -418,6 +475,7 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           this._forceShutdowns.delete(name);
           debug(`[${name}] Force shutdown during idle`);
           this._setStatus(name, "shutdown");
+          BUS.send(name, "lead", `'${name}' has been force-shutdown (was idle).`, "message");
           return;
         }
 
@@ -427,6 +485,7 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           for (const msg of inbox) {
             if (msg.type === "shutdown_request") {
               this._setStatus(name, "shutdown");
+              BUS.send(name, "lead", `'${name}' shut down (graceful request, was idle).`, "message");
               return;
             }
             messages.push({ role: "user", content: JSON.stringify(msg) });
@@ -435,11 +494,13 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
           break;
         }
 
-        // Scan task board for unclaimed tasks
-        const unclaimed = TASKS.scanUnclaimed();
+        // Scan task board: first check tasks assigned to me, then unclaimed
+        const assigned = TASKS.scanAssigned(name);
+        const unclaimed = assigned.length ? assigned : TASKS.scanUnclaimed();
         if (unclaimed.length) {
           const task = unclaimed[0];
-          TASKS.claimTask(task.id, name);
+          if (!task.owner) TASKS.claimTask(task.id, name);
+          if (task.status === "pending") TASKS.update(task.id, "in_progress", name);
           const taskPrompt = `<auto-claimed>Task #${task.id}: ${task.subject}\n${task.description || ""}</auto-claimed>`;
           // Identity re-injection after potential compression
           if (messages.length <= 3) {
@@ -463,6 +524,7 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
         // Idle timeout — auto shutdown
         debug(`[${name}] Idle timeout, shutting down`);
         this._setStatus(name, "shutdown");
+        BUS.send(name, "lead", `'${name}' shut down: idle timeout (${IDLE_TIMEOUT / 1000}s with no new tasks).`, "message");
         return;
       }
       this._setStatus(name, "working");
@@ -491,6 +553,9 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
       );
     if (toolName === "read_inbox")
       return JSON.stringify(BUS.readInbox(sender), null, 2);
+    if (toolName === "task_list") return TASKS.listAll();
+    if (toolName === "task_update")
+      return TASKS.update(parseInt(args.task_id), args.status as any, sender);
     if (toolName === "claim_task")
       return TASKS.claimTask(parseInt(args.task_id), sender);
     if (toolName === "shutdown_response") {
@@ -590,8 +655,29 @@ MANDATORY PROTOCOLS — you MUST follow these without exception:
         input_schema: { type: "object" as const, properties: {} },
       },
       {
+        name: "task_list",
+        description:
+          "List all tasks on the board with status, owner, and dependencies.",
+        input_schema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "task_update",
+        description: "Update a task's status (e.g. mark as completed).",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            task_id: { type: "integer" },
+            status: {
+              type: "string",
+              enum: ["pending", "in_progress", "completed"],
+            },
+          },
+          required: ["task_id", "status"],
+        },
+      },
+      {
         name: "claim_task",
-        description: "Claim a task from the task board by ID.",
+        description: "Claim an unowned task from the task board by ID.",
         input_schema: {
           type: "object" as const,
           properties: { task_id: { type: "integer" } },

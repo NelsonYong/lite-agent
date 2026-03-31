@@ -154,7 +154,7 @@ class TaskManager {
       id: this.nextId,
       subject,
       description,
-      status: "pending",
+      status: owner ? "in_progress" : "pending",
       owner,
       worktree: "",
       blockedBy: [],
@@ -248,6 +248,24 @@ class TaskManager {
           (t) =>
             t.status === "pending" &&
             !t.owner &&
+            (!t.blockedBy || !t.blockedBy.length),
+        )
+        .sort((a, b) => a.id - b.id);
+    } catch {
+      return [];
+    }
+  }
+
+  /** 扫描分配给指定 owner 但尚未完成的任务 */
+  scanAssigned(owner: string): Task[] {
+    try {
+      return readdirSync(this.dir)
+        .filter((f) => f.startsWith("task_") && f.endsWith(".json"))
+        .map((f) => JSON.parse(readFileSync(join(this.dir, f), "utf8")) as Task)
+        .filter(
+          (t) =>
+            t.owner === owner &&
+            t.status !== "completed" &&
             (!t.blockedBy || !t.blockedBy.length),
         )
         .sort((a, b) => a.id - b.id);
